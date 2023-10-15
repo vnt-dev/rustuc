@@ -4,9 +4,15 @@ use std::hash::Hash;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-#[derive(Clone)]
 pub(crate) struct ForwardingNode<K, V> {
     next_table: Arc<Vec<BaseNode<K, V>>>,
+}
+impl<K, V> Clone for ForwardingNode<K, V> {
+    fn clone(&self) -> Self {
+        Self {
+            next_table: self.next_table.clone(),
+        }
+    }
 }
 
 impl<K, V> ForwardingNode<K, V>
@@ -32,7 +38,7 @@ where
                             tab = &e.next_table;
                             continue;
                         }
-                        NodeEnums::TreeBin(e) => return e.find(h, key),
+                        NodeEnums::TreeBin(e) => return e.find(h, key,guard),
                     },
                 }
             }
