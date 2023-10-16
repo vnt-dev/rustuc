@@ -534,6 +534,7 @@ where
     /// to reduce systematic lossage, as well as to incorporate impact of the highest bits that would
     /// otherwise never be used in index calculations because of table bounds.
     fn spread(&self, key: &K) -> usize {
+        //todo 测试
         1
         // let hash = self.hash_builder.hash_one(key);
         // HASH_BITS & (hash ^ (hash >> 32)) as usize
