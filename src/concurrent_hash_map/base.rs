@@ -183,9 +183,6 @@ where
         let n = tab.len();
         let eb = &tab[(n - 1) & h];
         let mut e_node_share = eb.node.load(Ordering::Acquire, guard);
-        if e_node_share.is_null() {
-            return None;
-        }
         unsafe {
             if let Some(e) = e_node_share.as_ref() {
                 return match e {
@@ -534,7 +531,6 @@ where
     /// to reduce systematic lossage, as well as to incorporate impact of the highest bits that would
     /// otherwise never be used in index calculations because of table bounds.
     fn spread(&self, key: &K) -> usize {
-        //todo 测试
         1
         // let hash = self.hash_builder.hash_one(key);
         // HASH_BITS & (hash ^ (hash >> 32)) as usize

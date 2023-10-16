@@ -43,16 +43,15 @@ impl<K, V> TreeNode<K, V>
             red: false,
         }
     }
-    pub(crate) fn new_next(
+    pub(crate) fn new_parent(
         node: Arc<Node<K, V>>,
-        next: *mut TreeNode<K, V>,
         parent: *mut TreeNode<K, V>,
     ) -> TreeNode<K, V> {
         Self {
             node,
             parent,
             left: ptr::null_mut(),
-            right: next,
+            right: ptr::null_mut(),
             red: false,
         }
     }
@@ -501,6 +500,7 @@ impl<K, V> TreeBin<K, V>
     ) -> Option<&Node<K, V>> {
         let root = self.root;
         let mut p = root;
+        let mut searched = false; //todo
         loop {
             let pd = &(*p).node;
             let ph = pd.hash;
@@ -512,6 +512,21 @@ impl<K, V> TreeBin<K, V>
             } else if &pd.key == key {
                 return Some(pd);
             } else {
+                if searched{
+                    searched = true;
+                    let ch = (*p).left;
+                    if !ch.is_null(){
+                        if let Some(q) = (*ch).find_tree_node(h,key){
+                            return Some(&q.node)
+                        }
+                    }
+                    let ch = (*p).right;
+                    if !ch.is_null(){
+                        if let Some(q) = (*ch).find_tree_node(h,key){
+                            return Some(&q.node)
+                        }
+                    }
+                }
                 (*p).left
             };
             if p.is_null() {
@@ -527,7 +542,7 @@ impl<K, V> TreeBin<K, V>
                 if !shared.is_null() {
                     guard.defer_destroy(shared);
                 }
-                let x = Box::into_raw(Box::new(TreeNode::new_next(x, root, xp)));
+                let x = Box::into_raw(Box::new(TreeNode::new_parent(x,  xp)));
                 if ph >= h {
                     (*xp).left = x;
                 } else {
