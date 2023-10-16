@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 pub(crate) struct ForwardingNode<K, V> {
-    next_table: Arc<Vec<BaseNode<K, V>>>,
+    pub(crate) next_table: Arc<Vec<BaseNode<K, V>>>,
 }
 impl<K, V> Clone for ForwardingNode<K, V> {
     fn clone(&self) -> Self {
@@ -38,7 +38,7 @@ where
                             tab = &e.next_table;
                             continue;
                         }
-                        NodeEnums::TreeBin(e) => return e.find(h, key,guard),
+                        NodeEnums::TreeBin(e) => return e.find(h, key, guard),
                     },
                 }
             }

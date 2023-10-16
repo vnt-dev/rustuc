@@ -125,6 +125,15 @@ where
     K: Hash + Eq + Send + 'static,
     V: Send + 'static,
 {
+    pub fn len(&self)->usize{
+        unsafe {
+            if let Some(option) = self.table.load(Ordering::Acquire, &crossbeam_epoch::pin()).as_ref() {
+                option.len()
+            } else {
+                0
+            }
+        }
+    }
     pub fn new() -> ConcurrentHashMap<K, V> {
         INIT.call_once(|| unsafe {
             let n = thread::available_parallelism()
@@ -164,37 +173,32 @@ where
     }
 
     fn get(&self, key: &K) -> Option<Arc<V>> {
-        todo!()
-        // let h = self.spread(key);
-        // let guard = &crossbeam_epoch::pin();
-        // let tab = self.table.load(Ordering::Acquire, guard);
-        // if tab.is_null() {
-        //     return None;
-        // }
-        // let tab = unsafe { tab.deref() };
-        // let n = tab.len();
-        // let eb = &tab[(n - 1) & h];
-        // let mut e_node_share = eb.link_node.load(Ordering::Acquire, guard);
-        // if e_node_share.is_null() {
-        //     return None;
-        // }
-        // //todo 树
-        // loop {
-        //     let e = unsafe { e_node_share.deref() };
-        //     if &e.key == key {
-        //         unsafe {
-        //             return Some(e.val.load(Ordering::Acquire, guard).deref().clone());
-        //         }
-        //     }
-        //     let next_atomic = &e.next;
-        //     e_node_share = next_atomic.load(Ordering::Acquire, guard);
-        //     if e_node_share.is_null() {
-        //         return None;
-        //     }
-        // }
+        let h = self.spread(key);
+        let guard = &crossbeam_epoch::pin();
+        let tab = self.table.load(Ordering::Acquire, guard);
+        if tab.is_null() {
+            return None;
+        }
+        let tab = unsafe { tab.deref() };
+        let n = tab.len();
+        let eb = &tab[(n - 1) & h];
+        let mut e_node_share = eb.node.load(Ordering::Acquire, guard);
+        if e_node_share.is_null() {
+            return None;
+        }
+        unsafe {
+            if let Some(e) = e_node_share.as_ref() {
+                return match e {
+                    NodeEnums::Node(e) => e.find(h, key, guard),
+                    NodeEnums::ForwardingNode(e) => e.find(h, key, guard),
+                    NodeEnums::TreeBin(e) => e.find(h, key, guard),
+                };
+            }
+            return None;
+        }
     }
     fn insert(&self, key: K, value: V) -> Option<Arc<V>> {
-        self.insert_(key, value, false)
+        unsafe { self.put_val(key, value, false) }
     }
 }
 
@@ -241,12 +245,14 @@ where
             }
         }
     }
-    /// 添加到计数，如果表太小且尚未调整大小，则启动传输。如果已调整大小，则在工作可用时帮助执行传输。
-    /// 在转移后重新检查占用情况，以查看是否已经需要再次调整大小，因为调整大小是滞后添加。
-    /// 参数：
-    /// x – 要添加的计数
-    /// check – 如果<0，则不检查调整大小，如果<= 1，则仅检查是否无争议
-    fn add_count(&self, x: isize, check: isize) {
+    /// Adds to count, and if table is too small and not already resizing,
+    /// initiates transfer. If already resizing, helps perform transfer if work is available.
+    /// Rechecks occupancy after a transfer to see if another resize is already needed because
+    /// resizings are lagging additions.
+    /// Params:
+    ///  x    – the count to add
+    /// check – if <0, don't check resize, if <= 1 only check if uncontended
+    unsafe fn add_count(&self, x: isize, check: isize, guard: &Guard) {
         let mut s = 0;
         let cc = self.counter_cells.load(Ordering::Acquire);
         let h = self.hash_builder.hash_one(thread::current().id()) as usize;
@@ -271,9 +277,51 @@ where
             }
             s = self.sum_count();
         }
-        // if (check >= 0) {
-        //     //todo 转移
-        // }
+        if check >= 0 {
+            loop {
+                let sc = self.size_ctl.load(Ordering::Acquire);
+                if s < sc {
+                    break;
+                }
+                let tab = self.table.load(Ordering::Acquire, guard);
+                if let Some(tab) = tab.as_ref() {
+                    let n = tab.len();
+                    if n >= MAXIMUM_CAPACITY {
+                        break;
+                    }
+                    let rs = resize_stamp(n as isize);
+                    if sc < 0 {
+                        if (sc >> RESIZE_STAMP_SHIFT) != rs
+                            || sc == rs + 1
+                            || sc == rs + MAX_RESIZERS
+                        {
+                            break;
+                        }
+                        let nt = self.next_table.load(Ordering::Acquire, guard);
+                        if let Some(nt) = nt.as_ref() {
+                            if self.transfer_index.load(Ordering::Acquire) <= 0 {
+                                break;
+                            }
+                            if self
+                                .size_ctl
+                                .compare_exchange(sc, sc + 1, Ordering::AcqRel, Ordering::Relaxed)
+                                .is_ok()
+                            {
+                                self.transfer(tab, Some(nt.clone()), guard)
+                            }
+                        } else {
+                            break;
+                        }
+                    }else if self.size_ctl.compare_exchange(sc,(rs<<RESIZE_STAMP_SHIFT)+2,Ordering::AcqRel,Ordering::Relaxed).is_ok(){
+                        self.transfer(tab, None, guard)
+                    }
+                } else {
+                    break;
+                }
+                s = self.sum_count();
+
+            }
+        }
     }
     /// counter_cells 简化为大小固定的数组，避免内存回收的问题
     fn full_add_count(&self, x: isize, h: usize) {
@@ -330,95 +378,111 @@ where
         }
     }
 
-    fn insert_(&self, key: K, value: V, only_if_absent: bool) -> Option<Arc<V>> {
-        todo!()
-        // let hash = self.spread(&key);
-        // let value = Arc::new(value);
-        // let mut node = Owned::from(Arc::new(Node::new(hash, key, value.clone())));
-        // let guard = &crossbeam_epoch::pin();
-        // let mut bin_count = 0;
-        // let old: Option<Arc<V>> = 'a: loop {
-        //     let mut shared = self.table.load(Ordering::Acquire, guard);
-        //     if shared.is_null() {
-        //         shared = self.init_table(guard);
-        //     }
-        //     let table = unsafe { shared.deref() };
-        //     let n = table.len();
-        //     let f = &table[(n - 1) & hash];
-        //     let mut f_node_share = f.link_node.load(Ordering::Acquire, guard);
-        //     //节点为空则cas替换
-        //     if f_node_share.is_null() {
-        //         match f.link_node.compare_exchange(
-        //             f_node_share,
-        //             node,
-        //             Ordering::AcqRel,
-        //             Ordering::Acquire,
-        //             guard,
-        //         ) {
-        //             Ok(_) => {
-        //                 break None;
-        //             }
-        //             Err(e) => {
-        //                 node = e.new;
-        //                 f_node_share = e.current;
-        //             }
-        //         }
-        //     }
-        //     let f_node = unsafe { f_node_share.deref() };
-        //     if f_node.hash == MOVED {
-        //         //todo Helps transfer if a resize is in progress.
-        //     } else {
-        //         let mutex_guard = f.lock.lock();
-        //         let tag = f_node_share.as_raw();
-        //         f_node_share = f.link_node.load(Ordering::Acquire, guard);
-        //         if f_node_share.as_raw() == tag {
-        //             //是树
-        //             if f_node.hash == TREEBIN {
-        //                 bin_count = 2;
-        //             } else {
-        //                 //是链表
-        //                 let mut e = f_node;
-        //                 loop {
-        //                     if e.hash == hash && e.key == node.key {
-        //                         if only_if_absent {
-        //                             let old_val = e.val.load(Ordering::Acquire, guard);
-        //                             unsafe {
-        //                                 break 'a Some(old_val.deref().clone());
-        //                             }
-        //                         }
-        //                         let old_val =
-        //                             e.val.swap(Owned::init(value), Ordering::SeqCst, guard);
-        //                         unsafe {
-        //                             let rs = Some(old_val.deref().clone());
-        //                             guard.defer_destroy(old_val);
-        //                             break 'a rs;
-        //                         }
-        //                     }
-        //                     let next_atomic = &e.next;
-        //                     let next = next_atomic.load(Ordering::Acquire, guard);
-        //                     if next.is_null() {
-        //                         next_atomic.store(Owned::from(node), Ordering::Release);
-        //                         break 'a None;
-        //                     }
-        //                     e = unsafe { next.deref() };
-        //                 }
-        //             }
-        //         }
-        //         drop(mutex_guard);
-        //     }
-        // };
-        // if bin_count != 0 {
-        //     if bin_count >= TREEIFY_THRESHOLD {
-        //         //化树
-        //     }
-        // }
-        // match old {
-        //     None => {
-        //         self.add_count(1, bin_count as isize);
-        //         None
-        //     }
-        //     Some(v) => Some(v),
-        // }
+    unsafe fn put_val(&self, key: K, value: V, only_if_absent: bool) -> Option<Arc<V>> {
+        let hash = self.spread(&key);
+        let value = Arc::new(value);
+        let key = Arc::new(key);
+        let mut node_option: Option<Owned<NodeEnums<K, V>>> = None;
+        let guard = &crossbeam_epoch::pin();
+        let mut bin_count = 0;
+        let old: Option<Arc<V>> = 'a: loop {
+            let mut shared = self.table.load(Ordering::Acquire, guard);
+            if shared.is_null() {
+                shared = self.init_table(guard);
+            }
+            let table = unsafe { shared.deref() };
+            let n = table.len();
+            let i = (n - 1) & hash;
+            let f = &table[i];
+            let f_node_atomic = &f.node;
+            let mut f_node_share = f_node_atomic.load(Ordering::Acquire, guard);
+            //节点为空则cas替换
+            if f_node_share.is_null() {
+                let node = node_option.unwrap_or_else(|| {
+                    Owned::new(NodeEnums::Node(Arc::new(Node::new(
+                        hash,
+                        key.clone(),
+                        value.clone(),
+                    ))))
+                });
+                match f_node_atomic.compare_exchange(
+                    f_node_share,
+                    node,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                    guard,
+                ) {
+                    Ok(_) => {
+                        break None;
+                    }
+                    Err(e) => {
+                        node_option = Some(e.new);
+                        f_node_share = e.current;
+                    }
+                }
+            }
+            let f_node = unsafe { f_node_share.deref_mut() };
+            if let NodeEnums::ForwardingNode(f_move) = f_node {
+                self.help_transfer(table, &f_move.next_table, guard);
+            } else {
+                let mutex_guard = f.lock.lock();
+                if f_node_atomic.load(Ordering::Acquire, guard) == f_node_share {
+                    match f_node {
+                        NodeEnums::Node(link_node) => {
+                            bin_count = 1;
+                            let mut e = link_node.deref();
+                            loop {
+                                if e.hash == hash && e.key == key {
+                                    let old = e.val.load(Ordering::Acquire, guard).deref().clone();
+                                    if !only_if_absent {
+                                        let shared =
+                                            e.val.swap(Owned::new(value), Ordering::AcqRel, guard);
+                                        guard.defer_destroy(shared);
+                                    }
+                                    break 'a Some(old);
+                                }
+                                if let Some(next) = e.next.load(Ordering::Acquire, guard).as_ref() {
+                                    e = next;
+                                } else {
+                                    e.next.store(
+                                        Owned::new(Arc::new(Node::new(hash, key, value))),
+                                        Ordering::Release,
+                                    );
+                                    drop(mutex_guard);
+                                    if bin_count >= TREEIFY_THRESHOLD {
+                                        self.treeify_bin(table, i, guard);
+                                    }
+                                    break 'a None;
+                                }
+                                bin_count += 1;
+                            }
+                        }
+                        NodeEnums::TreeBin(f) => {
+                            bin_count = 2;
+                            if let Some(p) = f.put_tree_val(hash, &key, &value, guard) {
+                                let old = p.val.load(Ordering::Acquire, guard).deref().clone();
+                                if !only_if_absent {
+                                    let shared =
+                                        p.val.swap(Owned::new(value), Ordering::AcqRel, guard);
+                                    guard.defer_destroy(shared);
+                                }
+                                break 'a Some(old);
+                            }
+                            break 'a None;
+                        }
+                        _ => {}
+                    }
+                }
+                drop(mutex_guard);
+            }
+        };
+        match old {
+            None => {
+                self.add_count(1, bin_count as isize, guard);
+                None
+            }
+            Some(v) => Some(v),
+        }
     }
     /// Replaces all linked nodes in bin at given index unless table is
     /// too small, in which case resizes instead.
@@ -439,7 +503,7 @@ where
                         // Reuse existing linked lists
                         while let Some(pd) = e.next.load(Ordering::Acquire, guard).as_ref() {
                             // Do not maintain 'prev' when using linked lists
-                            pd.prev.store(Owned::new(e.clone()),Ordering::Release);
+                            pd.prev.store(Owned::new(e.clone()), Ordering::Release);
                             let p = Box::into_raw(Box::new(TreeNode::new(pd.clone())));
                             // Use 'right' as' next '
                             (*tail).right = p;
@@ -470,8 +534,9 @@ where
     /// to reduce systematic lossage, as well as to incorporate impact of the highest bits that would
     /// otherwise never be used in index calculations because of table bounds.
     fn spread(&self, key: &K) -> usize {
-        let hash = self.hash_builder.hash_one(key);
-        HASH_BITS & (hash ^ (hash >> 32)) as usize
+        1
+        // let hash = self.hash_builder.hash_one(key);
+        // HASH_BITS & (hash ^ (hash >> 32)) as usize
     }
     /// Tries to presize table to accommodate the given number of elements.
     /// Params:
@@ -547,7 +612,35 @@ where
                     .is_ok()
                 {
                     self.transfer(tab, None, guard);
+                    return;
                 }
+            }
+        }
+    }
+    /// Helps transfer if a resize is in progress.
+    unsafe fn help_transfer(
+        &self,
+        tab: &Vec<BaseNode<K, V>>,
+        next_tab: &Arc<Vec<BaseNode<K, V>>>,
+        guard: &Guard,
+    ) {
+        let rs = resize_stamp(tab.len() as isize);
+        loop {
+            let sc = self.size_ctl.load(Ordering::Acquire);
+            if (sc >> RESIZE_STAMP_SHIFT) != rs
+                || sc == rs + 1
+                || sc == rs + MAX_RESIZERS
+                || self.transfer_index.load(Ordering::Acquire) <= 0
+            {
+                return;
+            }
+            if self
+                .size_ctl
+                .compare_exchange(sc, sc + 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.transfer(tab, Some(next_tab.clone()), guard);
+                return;
             }
         }
     }
@@ -569,7 +662,8 @@ where
             None => {
                 // initiating
                 match panic::catch_unwind(|| {
-                    let mut tab: Vec<BaseNode<K, V>> = Vec::with_capacity(n << 1);
+                    let n = n << 1;
+                    let mut tab: Vec<BaseNode<K, V>> = Vec::with_capacity(n );
                     tab.resize_with(n, || BaseNode::new());
                     let tab = Arc::new(tab);
                     (Owned::new(tab.clone()), tab)
@@ -590,7 +684,7 @@ where
         let nextn = next_tab.len() as isize;
         let fwd = ForwardingNode::new(next_tab.clone());
         let mut advance = true;
-        let mut finishing = true; // to ensure sweep before committing nextTab
+        let mut finishing = false; // to ensure sweep before committing nextTab
         let mut i = 0;
         let mut bound = 0;
         let transfer_index = &self.transfer_index;
@@ -738,7 +832,10 @@ where
                                     Node::new(h, ek, ev),
                                 ))));
                                 if (h & n) == 0 {
-                                    (*p).node.prev.store(Owned::new((*lo_tail).node.clone()),Ordering::Release);
+                                    (*p).node.prev.store(
+                                        Owned::new((*lo_tail).node.clone()),
+                                        Ordering::Release,
+                                    );
                                     if lo_tail.is_null() {
                                         lo = p;
                                     } else {
@@ -751,7 +848,10 @@ where
                                     lo_tail = p;
                                     lc += 1;
                                 } else {
-                                    (*p).node.prev.store(Owned::new((*hi_tail).node.clone()),Ordering::Release);
+                                    (*p).node.prev.store(
+                                        Owned::new((*hi_tail).node.clone()),
+                                        Ordering::Release,
+                                    );
                                     if hi_tail.is_null() {
                                         hi = p;
                                     } else {
@@ -798,9 +898,6 @@ where
                                 Ordering::AcqRel,
                                 guard,
                             );
-                            // Obtaining a write lock indicates that there are no threads reading from the old node
-                            t.lock_root(guard);
-                            t.unlock_root();
                             guard.defer_destroy(shared);
                             advance = true;
                         }

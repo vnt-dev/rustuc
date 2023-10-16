@@ -1,6 +1,7 @@
 use crossbeam_epoch::{Atomic, Guard, Owned, Shared};
 use std::hash::Hash;
 use std::ops::Deref;
+use std::ptr::null;
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::Arc;
 use std::thread::Thread;
@@ -30,8 +31,8 @@ impl<K, V> Drop for TreeNode<K, V> {
 }
 
 impl<K, V> TreeNode<K, V>
-    where
-        K: Hash + Eq,
+where
+    K: Hash + Eq,
 {
     pub(crate) fn new(node: Arc<Node<K, V>>) -> TreeNode<K, V> {
         Self {
@@ -42,7 +43,11 @@ impl<K, V> TreeNode<K, V>
             red: false,
         }
     }
-    pub(crate) fn new_next(node: Arc<Node<K, V>>,next:*mut TreeNode<K, V>,parent:*mut TreeNode<K, V>) -> TreeNode<K, V> {
+    pub(crate) fn new_next(
+        node: Arc<Node<K, V>>,
+        next: *mut TreeNode<K, V>,
+        parent: *mut TreeNode<K, V>,
+    ) -> TreeNode<K, V> {
         Self {
             node,
             parent,
@@ -72,7 +77,7 @@ impl<K, V> TreeNode<K, V>
                 return Some(p);
             } else if !pl.is_null() {
                 p = &*pl
-            }  else {
+            } else {
                 return None;
             }
         }
@@ -218,6 +223,109 @@ impl<K, V> TreeBin<K, V> {
             }
         }
     }
+    unsafe fn balance_deletion(
+        mut root: *mut TreeNode<K, V>,
+        mut x: *mut TreeNode<K, V>,
+    ) -> *mut TreeNode<K, V> {
+        loop {
+            if x.is_null() || x == root {
+                return root;
+            }
+            let mut xp = (*x).parent;
+            if xp.is_null() {
+                (*x).red = false;
+                return x;
+            }
+            if (*x).red {
+                (*x).red = false;
+                return root;
+            }
+            let mut xpl = (*xp).left;
+            if xpl == x {
+                let mut xpr = (*xp).right;
+                if !xpr.is_null() && (*xpr).red {
+                    (*xpr).red = false;
+                    (*xp).red = true;
+                    root = Self::rotate_left(root, xp);
+                    xp = (*x).parent;
+                    xpr = if xp.is_null() { xp } else { (*xp).right };
+                }
+                if xpr.is_null() {
+                    x = xp;
+                } else {
+                    let sl = (*xpr).left;
+                    let mut sr = (*xpr).right;
+                    if (sr.is_null() || !(*sr).red) && (sl.is_null() || !(*sl).red) {
+                        (*xpr).red = true;
+                        x = xp;
+                    } else {
+                        if sr.is_null() || !(*sr).red {
+                            if !sl.is_null() {
+                                (*sl).red = false;
+                            }
+                            (*xpr).red = true;
+                            root = Self::rotate_right(root, xpr);
+                            xp = (*x).parent;
+                            xpr = if xp.is_null() { xp } else { (*xp).right };
+                        }
+                        if !xpr.is_null() {
+                            (*xpr).red = if xp.is_null() { false } else { (*xp).red };
+                            sr = (*xpr).right;
+                            if !sr.is_null() {
+                                (*sr).red = false;
+                            }
+                        }
+                        if !xp.is_null() {
+                            (*xp).red = false;
+                            root = Self::rotate_left(root, xp);
+                        }
+                        x = root;
+                    }
+                }
+            } else {
+                // symmetric
+                if !xpl.is_null() && (*xpl).red {
+                    (*xpl).red = false;
+                    (*xp).red = true;
+                    root = Self::rotate_right(root, xp);
+                    xp = (*x).parent;
+                    xpl = if xp.is_null() { xp } else { (*xp).left };
+                }
+                if xpl.is_null() {
+                    x = xp;
+                } else {
+                    let mut sl = (*xpl).left;
+                    let sr = (*xpl).right;
+                    if (sl.is_null() || !(*sl).red) && (sr.is_null() || !(*sr).red) {
+                        (*xpl).red = true;
+                        x = xp;
+                    } else {
+                        if sl.is_null() || !(*sl).red {
+                            if !sr.is_null() {
+                                (*sr).red = false;
+                            }
+                            (*xpl).red = true;
+                            root = Self::rotate_left(root, xpl);
+                            xp = (*x).parent;
+                            xpl = if xp.is_null() { xp } else { (*xp).left };
+                        }
+                        if !xpl.is_null() {
+                            (*xpl).red = if xp.is_null() { false } else { (*xp).red };
+                            sl = (*xpl).left;
+                            if !sl.is_null() {
+                                (*sl).red = false;
+                            }
+                        }
+                        if !xp.is_null() {
+                            (*xp).red = false;
+                            root = Self::rotate_right(root, xp);
+                        }
+                        x = root;
+                    }
+                }
+            }
+        }
+    }
     /// Red-black tree methods, all adapted from CLR
     unsafe fn rotate_left(
         mut root: *mut TreeNode<K, V>,
@@ -331,20 +439,58 @@ impl<K, V> TreeBin<K, V> {
     }
 }
 
-impl<K, V> TreeBin<K, V> where
-    K: Hash + Eq, {
+impl<K, V> TreeBin<K, V>
+where
+    K: Hash + Eq,
+{
+    /// Returns matching node or null if none. Tries to search using tree comparisons from root,
+    /// but continues linear search when lock not available.
     pub(crate) unsafe fn find(&self, h: usize, key: &K, guard: &Guard) -> Option<Arc<V>> {
-        let e = self.first.load(Ordering::Acquire,guard);
+        let mut e_shared = self.first.load(Ordering::Acquire, guard);
         let lock_state = &self.lock_state;
-        while let Some(e) = e.as_ref(){
+        while let Some(e) = e_shared.as_ref() {
             let s = lock_state.load(Ordering::Acquire);
-            if s&(WAITER|WRITER)==0{
-                todo!("java.util.concurrent.ConcurrentHashMap.TreeBin#find")
+            if s & (WAITER | WRITER) != 0 {
+                if e.hash == h && e.key.deref() == key {
+                    return Some(e.val.load(Ordering::Acquire, guard).deref().clone());
+                }
+                e_shared = e.next.load(Ordering::Acquire, guard);
+            } else if lock_state
+                .compare_exchange(s, s + READER, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                let root = self.root;
+                // not null
+                let p = if !root.is_null() {
+                    if let Some(t) = (*root).find_tree_node(h, key) {
+                        Some(t.node.val.load(Ordering::Acquire, guard).deref().clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if lock_state.fetch_add(-READER, Ordering::AcqRel) == (READER | WAITER) {
+                    let w = self.waiter.load(Ordering::Acquire, guard);
+                    if let Some(w) = w.as_ref() {
+                        w.unpark();
+                    }
+                }
+                return p;
             }
         }
         None
     }
-    pub(crate) unsafe fn put_tree_val(&mut self, h: usize, key: K, value: V, guard: &Guard) -> Option<&Node<K, V>> {
+    /// Finds or adds a node.
+    /// Returns:
+    /// null if added
+    pub(crate) unsafe fn put_tree_val(
+        &mut self,
+        h: usize,
+        key: &Arc<K>,
+        value: &Arc<V>,
+        guard: &Guard,
+    ) -> Option<&Node<K, V>> {
         let root = self.root;
         let mut p = root;
         loop {
@@ -355,33 +501,184 @@ impl<K, V> TreeBin<K, V> where
                 (*p).left
             } else if ph < h {
                 (*p).right
-            } else if pd.key.deref() == &key {
+            } else if &pd.key == key {
                 return Some(pd);
-            }else{
+            } else {
                 (*p).left
             };
-            if p.is_null(){
-                let f = self.first.load(Ordering::Acquire,guard).deref();
-                let x = Arc::new(Node::new_next(h,Arc::new(key),Arc::new(value),f.clone()));
-                // Old nodes do not need to be recycled
-                self.first.store(Owned::new(x.clone()), Ordering::Release);
-                f.prev.store(Owned::new(f.clone()),Ordering::Release);
-                let x = Box::into_raw(Box::new( TreeNode::new_next(x,root,xp)));
-                if ph >= h{
+            if p.is_null() {
+                let f = self.first.load(Ordering::Acquire, guard).deref();
+                let x = Arc::new(Node::new_next(h, key.clone(), value.clone(), f.clone()));
+                let shared = self
+                    .first
+                    .swap(Owned::new(x.clone()), Ordering::AcqRel, guard);
+                if !shared.is_null() {
+                    guard.defer_destroy(shared);
+                }
+                let shared = f.prev.swap(Owned::new(f.clone()), Ordering::AcqRel, guard);
+                if !shared.is_null() {
+                    guard.defer_destroy(shared);
+                }
+                let x = Box::into_raw(Box::new(TreeNode::new_next(x, root, xp)));
+                if ph >= h {
                     (*xp).left = x;
-                }else{
+                } else {
                     (*xp).right = x;
                 }
                 if !(*xp).red {
                     (*x).red = true;
-                }else{
+                } else {
                     self.lock_root(guard);
-                    self.root = Self::balance_insertion(root,x);
+                    self.root = Self::balance_insertion(root, x);
                     self.unlock_root();
                 }
                 return None;
             }
         }
+    }
+    /// Removes the given node, that must be present before this call.
+    /// This is messier than typical red-black deletion code because we cannot swap the contents
+    /// of an interior node with a leaf successor that is pinned by "next" pointers that are
+    /// accessible independently of lock. So instead we swap the tree linkages.
+    /// Returns:
+    /// true if now too small, so should be untreeified
+    pub(crate) unsafe fn remove_tree_node(
+        &mut self,
+        p: *mut TreeNode<K, V>,
+        guard: &Guard,
+    ) -> bool {
+        let null = ptr::null_mut();
+        let next = (*p).node.next.load(Ordering::Acquire, guard);
+        let prev = (*p).node.prev.load(Ordering::Acquire, guard); // unlink traversal pointers
+        let (shared, is_null) = if let Some(prev) = prev.as_ref() {
+            (prev.next.swap(next, Ordering::AcqRel, guard), false)
+        } else {
+            let is_null = next.is_null();
+            (self.first.swap(next, Ordering::AcqRel, guard), is_null)
+        };
+        if !shared.is_null() {
+            guard.defer_destroy(shared);
+        }
+        if is_null {
+            return true;
+        }
+        if let Some(next) = next.as_ref() {
+            let shared = next.prev.swap(prev, Ordering::AcqRel, guard);
+            if !shared.is_null() {
+                guard.defer_destroy(shared);
+            }
+        }
+        let mut r = self.root;
+        let replacement;
+        if r.is_null() || (*r).right.is_null() {
+            // too small
+            return true;
+        }
+        let rl = (*r).left;
+        if rl.is_null() || (*rl).left.is_null() {
+            // too small
+            return true;
+        }
+        self.lock_root(guard);
+        {
+            let pl = (*p).left;
+            let pr = (*p).right;
+            if !pl.is_null() && !pr.is_null() {
+                let mut s = pr;
+                let mut sl;
+                while {
+                    sl = (*s).left;
+                    !sl.is_null()
+                } {
+                    s = sl;
+                }
+                // swap colors
+                let c = (*s).red;
+                (*s).red = (*p).red;
+                (*p).red = c;
+                let sr = (*s).right;
+                let pp = (*p).parent;
+                if s == pr {
+                    // p was s's direct parent
+                    (*p).parent = s;
+                    (*s).right = p;
+                } else {
+                    let sp = (*s).parent;
+                    (*p).parent = sp;
+                    if !sp.is_null() {
+                        if s == (*sp).left {
+                            (*sp).left = p;
+                        } else {
+                            (*sp).right = p;
+                        }
+                    }
+                    (*s).right = pr;
+                    if !pr.is_null() {
+                        (*pr).parent = s;
+                    }
+                }
+                (*p).left = ptr::null_mut();
+                (*p).right = sr;
+                if !sr.is_null() {
+                    (*sr).parent = p;
+                }
+                (*s).left = pl;
+                if !pl.is_null() {
+                    (*pl).parent = s;
+                }
+                (*s).parent = pp;
+                if pp.is_null() {
+                    r = s;
+                } else if p == (*pp).left {
+                    (*pp).left = s;
+                } else {
+                    (*pp).right = s;
+                }
+                if !sr.is_null() {
+                    replacement = sr;
+                } else {
+                    replacement = p;
+                }
+            } else if !pl.is_null() {
+                replacement = pl;
+            } else if !pr.is_null() {
+                replacement = pr;
+            } else {
+                replacement = p;
+            }
+            if replacement != p {
+                let pp = (*p).parent;
+                (*replacement).parent = pp;
+                if pp.is_null() {
+                    r = replacement;
+                } else if p == (*pp).left {
+                    (*pp).left = replacement;
+                } else {
+                    (*pp).right = replacement;
+                }
+                (*p).parent = null;
+                (*p).right = null;
+                (*p).left = null;
+            }
+            self.root = if (*p).red {
+                r
+            } else {
+                Self::balance_deletion(r, replacement)
+            };
+            if p == replacement {
+                let pp = (*p).parent;
+                if !pp.is_null() {
+                    if p == (*pp).left {
+                        (*pp).left = null;
+                    } else if p == (*pp).right {
+                        (*pp).right = null;
+                        (*p).parent = null;
+                    }
+                }
+            }
+        }
+        self.unlock_root();
+        false
     }
 }
 
