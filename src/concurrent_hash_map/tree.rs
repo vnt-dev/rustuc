@@ -31,8 +31,8 @@ impl<K, V> Drop for TreeNode<K, V> {
 }
 
 impl<K, V> TreeNode<K, V>
-where
-    K: Hash + Eq,
+    where
+        K: Hash + Eq,
 {
     pub(crate) fn new(node: Arc<Node<K, V>>) -> TreeNode<K, V> {
         Self {
@@ -56,7 +56,7 @@ where
             red: false,
         }
     }
-    /// 此操作和更新树结构互斥
+    /// Returns the TreeNode (or null if not found) for the given key starting at given root.
     pub(crate) unsafe fn find_tree_node(&self, h: usize, key: &K) -> Option<&TreeNode<K, V>> {
         let mut p = self;
         loop {
@@ -75,10 +75,18 @@ where
                 p = &*pr;
             } else if p.node.key.deref() == key {
                 return Some(p);
-            } else if !pl.is_null() {
+            } else if pl.is_null() {
+                if pr.is_null() {
+                    return None;
+                }
+                p = &*pr
+            } else if pr.is_null(){
                 p = &*pl
             } else {
-                return None;
+                if let Some(q) = (*pr).find_tree_node(h,key){
+                    return Some(q);
+                }
+                p = &*pl
             }
         }
     }
@@ -440,8 +448,8 @@ impl<K, V> TreeBin<K, V> {
 }
 
 impl<K, V> TreeBin<K, V>
-where
-    K: Hash + Eq,
+    where
+        K: Hash + Eq,
 {
     /// Returns matching node or null if none. Tries to search using tree comparisons from root,
     /// but continues linear search when lock not available.
