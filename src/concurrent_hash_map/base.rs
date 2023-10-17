@@ -414,7 +414,7 @@ where
                     }
                     Err(e) => {
                         node_option = Some(e.new);
-                        f_node_share = e.current;
+                        continue;
                     }
                 }
             }
@@ -531,9 +531,8 @@ where
     /// to reduce systematic lossage, as well as to incorporate impact of the highest bits that would
     /// otherwise never be used in index calculations because of table bounds.
     fn spread(&self, key: &K) -> usize {
-        1
-        // let hash = self.hash_builder.hash_one(key);
-        // HASH_BITS & (hash ^ (hash >> 32)) as usize
+        let hash = self.hash_builder.hash_one(key);
+        HASH_BITS & (hash ^ (hash >> 32)) as usize
     }
     /// Tries to presize table to accommodate the given number of elements.
     /// Params:
@@ -829,13 +828,13 @@ where
                                     Node::new(h, ek, ev),
                                 ))));
                                 if (h & n) == 0 {
-                                    (*p).node.prev.store(
-                                        Owned::new((*lo_tail).node.clone()),
-                                        Ordering::Release,
-                                    );
                                     if lo_tail.is_null() {
                                         lo = p;
                                     } else {
+                                        (*p).node.prev.store(
+                                            Owned::new((*lo_tail).node.clone()),
+                                            Ordering::Release,
+                                        );
                                         (*lo_tail).node.next.store(
                                             Owned::new((*p).node.clone()),
                                             Ordering::Release,
@@ -845,13 +844,13 @@ where
                                     lo_tail = p;
                                     lc += 1;
                                 } else {
-                                    (*p).node.prev.store(
-                                        Owned::new((*hi_tail).node.clone()),
-                                        Ordering::Release,
-                                    );
                                     if hi_tail.is_null() {
                                         hi = p;
                                     } else {
+                                        (*p).node.prev.store(
+                                            Owned::new((*hi_tail).node.clone()),
+                                            Ordering::Release,
+                                        );
                                         (*hi_tail).node.next.store(
                                             Owned::new((*p).node.clone()),
                                             Ordering::Release,
@@ -884,10 +883,10 @@ where
                                 Some(Owned::new(NodeEnums::TreeBin(TreeBin::new(hi))))
                             };
                             if let Some(ln) = ln {
-                                next_tab[i as usize].node.store(ln, Ordering::AcqRel);
+                                next_tab[i as usize].node.store(ln, Ordering::Release);
                             }
                             if let Some(hn) = hn {
-                                next_tab[i as usize + n].node.store(hn, Ordering::AcqRel);
+                                next_tab[i as usize + n].node.store(hn, Ordering::Release);
                             }
 
                             let shared = tab_at.node.swap(
