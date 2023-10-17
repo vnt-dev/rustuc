@@ -51,19 +51,23 @@ where
             prev: Atomic::null(),
         }
     }
-    pub(crate) fn find(self: &Arc<Node<K, V>>, h: usize, key: &K, guard: &Guard) -> Option<Arc<V>> {
+    pub(crate) unsafe fn find(
+        self: &Arc<Node<K, V>>,
+        h: usize,
+        key: &K,
+        guard: &Guard,
+    ) -> Option<Arc<V>> {
         let mut e = self;
         loop {
             if e.hash == h && e.key.deref() == key {
-                unsafe {
-                    return Some(e.val.load(Ordering::Acquire, guard).deref().clone());
-                }
+                return Some(e.val.load(Ordering::Acquire, guard).deref().clone());
             }
             let p = e.next.load(Ordering::Acquire, guard);
-            if p.is_null() {
+            if let Some(p) = p.as_ref() {
+                e = p;
+            } else {
                 return None;
             }
-            unsafe { e = p.deref() }
         }
     }
 }

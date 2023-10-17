@@ -15,7 +15,7 @@ use crate::concurrent_hash_map::node::Node;
 use crate::concurrent_hash_map::tree::{TreeBin, TreeNode};
 
 pub(crate) struct BaseNode<K, V> {
-    lock: Mutex<bool>,
+    lock: Mutex<()>,
     pub(crate) node: Atomic<NodeEnums<K, V>>,
 }
 
@@ -40,7 +40,7 @@ where
 {
     fn new() -> BaseNode<K, V> {
         Self {
-            lock: Mutex::new(false),
+            lock: Mutex::new(()),
             node: Atomic::null(),
         }
     }
@@ -125,9 +125,13 @@ where
     K: Hash + Eq + Send + 'static,
     V: Send + 'static,
 {
-    pub fn len(&self)->usize{
+    pub fn len(&self) -> usize {
         unsafe {
-            if let Some(option) = self.table.load(Ordering::Acquire, &crossbeam_epoch::pin()).as_ref() {
+            if let Some(option) = self
+                .table
+                .load(Ordering::Acquire, &crossbeam_epoch::pin())
+                .as_ref()
+            {
                 option.len()
             } else {
                 0
@@ -176,23 +180,22 @@ where
         let h = self.spread(key);
         let guard = &crossbeam_epoch::pin();
         let tab = self.table.load(Ordering::Acquire, guard);
-        if tab.is_null() {
-            return None;
-        }
-        let tab = unsafe { tab.deref() };
-        let n = tab.len();
-        let eb = &tab[(n - 1) & h];
-        let mut e_node_share = eb.node.load(Ordering::Acquire, guard);
         unsafe {
-            if let Some(e) = e_node_share.as_ref() {
-                return match e {
-                    NodeEnums::Node(e) => e.find(h, key, guard),
-                    NodeEnums::ForwardingNode(e) => e.find(h, key, guard),
-                    NodeEnums::TreeBin(e) => e.find(h, key, guard),
-                };
+            if let Some(tab) = tab.as_ref() {
+                let n = tab.len();
+                let eb = &tab[(n - 1) & h];
+                let mut e_node_share = eb.node.load(Ordering::Acquire, guard);
+                if let Some(e) = e_node_share.as_ref() {
+                    return match e {
+                        NodeEnums::Node(e) => e.find(h, key, guard),
+                        NodeEnums::ForwardingNode(e) => e.find(h, key, guard),
+                        NodeEnums::TreeBin(e) => e.find(h, key, guard),
+                    };
+                }
+                return None;
             }
-            return None;
         }
+        return None;
     }
     fn insert(&self, key: K, value: V) -> Option<Arc<V>> {
         unsafe { self.put_val(key, value, false) }
@@ -309,14 +312,22 @@ where
                         } else {
                             break;
                         }
-                    }else if self.size_ctl.compare_exchange(sc,(rs<<RESIZE_STAMP_SHIFT)+2,Ordering::AcqRel,Ordering::Relaxed).is_ok(){
+                    } else if self
+                        .size_ctl
+                        .compare_exchange(
+                            sc,
+                            (rs << RESIZE_STAMP_SHIFT) + 2,
+                            Ordering::AcqRel,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                    {
                         self.transfer(tab, None, guard)
                     }
                 } else {
                     break;
                 }
                 s = self.sum_count();
-
             }
         }
     }
@@ -530,6 +541,7 @@ where
     /// handle large sets of collisions in bins, we just XOR some shifted bits in the cheapest possible way
     /// to reduce systematic lossage, as well as to incorporate impact of the highest bits that would
     /// otherwise never be used in index calculations because of table bounds.
+    #[inline]
     fn spread(&self, key: &K) -> usize {
         let hash = self.hash_builder.hash_one(key);
         HASH_BITS & (hash ^ (hash >> 32)) as usize
@@ -659,7 +671,7 @@ where
                 // initiating
                 match panic::catch_unwind(|| {
                     let n = n << 1;
-                    let mut tab: Vec<BaseNode<K, V>> = Vec::with_capacity(n );
+                    let mut tab: Vec<BaseNode<K, V>> = Vec::with_capacity(n);
                     tab.resize_with(n, || BaseNode::new());
                     let tab = Arc::new(tab);
                     (Owned::new(tab.clone()), tab)

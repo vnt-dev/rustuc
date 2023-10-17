@@ -1,11 +1,12 @@
 use crossbeam_epoch::{Atomic, Guard, Owned, Shared};
+use std::any::Any;
 use std::hash::Hash;
 use std::ops::Deref;
 use std::ptr::null;
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::Arc;
 use std::thread::Thread;
-use std::{ptr, thread};
+use std::{cmp, ptr, thread};
 
 use crate::concurrent_hash_map::node::Node;
 
@@ -31,8 +32,8 @@ impl<K, V> Drop for TreeNode<K, V> {
 }
 
 impl<K, V> TreeNode<K, V>
-    where
-        K: Hash + Eq,
+where
+    K: Hash + Eq,
 {
     pub(crate) fn new(node: Arc<Node<K, V>>) -> TreeNode<K, V> {
         Self {
@@ -43,10 +44,7 @@ impl<K, V> TreeNode<K, V>
             red: false,
         }
     }
-    pub(crate) fn new_parent(
-        node: Arc<Node<K, V>>,
-        parent: *mut TreeNode<K, V>,
-    ) -> TreeNode<K, V> {
+    pub(crate) fn new_parent(node: Arc<Node<K, V>>, parent: *mut TreeNode<K, V>) -> TreeNode<K, V> {
         Self {
             node,
             parent,
@@ -79,10 +77,10 @@ impl<K, V> TreeNode<K, V>
                     return None;
                 }
                 p = &*pr
-            } else if pr.is_null(){
+            } else if pr.is_null() {
                 p = &*pl
             } else {
-                if let Some(q) = (*pr).find_tree_node(h,key){
+                if let Some(q) = (*pr).find_tree_node(h, key) {
                     return Some(q);
                 }
                 p = &*pl
@@ -447,8 +445,8 @@ impl<K, V> TreeBin<K, V> {
 }
 
 impl<K, V> TreeBin<K, V>
-    where
-        K: Hash + Eq,
+where
+    K: Hash + Eq,
 {
     /// Returns matching node or null if none. Tries to search using tree comparisons from root,
     /// but continues linear search when lock not available.
@@ -500,7 +498,7 @@ impl<K, V> TreeBin<K, V>
     ) -> Option<&Node<K, V>> {
         let root = self.root;
         let mut p = root;
-        let mut searched = false; //todo
+        let mut searched = false;
         loop {
             let pd = &(*p).node;
             let ph = pd.hash;
@@ -512,18 +510,18 @@ impl<K, V> TreeBin<K, V>
             } else if &pd.key == key {
                 return Some(pd);
             } else {
-                if searched{
+                if searched {
                     searched = true;
                     let ch = (*p).left;
-                    if !ch.is_null(){
-                        if let Some(q) = (*ch).find_tree_node(h,key){
-                            return Some(&q.node)
+                    if !ch.is_null() {
+                        if let Some(q) = (*ch).find_tree_node(h, key) {
+                            return Some(&q.node);
                         }
                     }
                     let ch = (*p).right;
-                    if !ch.is_null(){
-                        if let Some(q) = (*ch).find_tree_node(h,key){
-                            return Some(&q.node)
+                    if !ch.is_null() {
+                        if let Some(q) = (*ch).find_tree_node(h, key) {
+                            return Some(&q.node);
                         }
                     }
                 }
@@ -542,7 +540,7 @@ impl<K, V> TreeBin<K, V>
                 if !shared.is_null() {
                     guard.defer_destroy(shared);
                 }
-                let x = Box::into_raw(Box::new(TreeNode::new_parent(x,  xp)));
+                let x = Box::into_raw(Box::new(TreeNode::new_parent(x, xp)));
                 if ph >= h {
                     (*xp).left = x;
                 } else {
