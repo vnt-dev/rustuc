@@ -1,2 +1,1 @@
-mod collector;
-pub use collector::Collector;
+pub mod collector;

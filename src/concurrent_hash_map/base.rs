@@ -6,21 +6,22 @@ use std::sync::atomic::{AtomicIsize, AtomicPtr, Ordering};
 use std::sync::{Arc, Once};
 use std::{panic, ptr, thread};
 
-use crossbeam_epoch::{Atomic, Guard, Owned, Shared};
 use parking_lot::Mutex;
 
 use crate::concurrent_hash_map::forwarding::ForwardingNode;
-use crate::concurrent_hash_map::map::Map;
+use crate::concurrent_hash_map::map::{Map, Value};
 use crate::concurrent_hash_map::node::Node;
 use crate::concurrent_hash_map::tree::{TreeBin, TreeNode};
+use crate::ebr::collector::{Collector, Guard};
 
 pub(crate) struct BaseNode<K, V> {
+    pub(crate) node: AtomicPtr<NodeEnums<K, V>>,
+    pub(crate) k: AtomicPtr<u32>,
     lock: Mutex<()>,
-    pub(crate) node: Atomic<NodeEnums<K, V>>,
 }
 
 pub(crate) enum NodeEnums<K, V> {
-    Node(Arc<Node<K, V>>),
+    Node(Node<K, V>),
     ForwardingNode(ForwardingNode<K, V>),
     TreeBin(TreeBin<K, V>),
 }
@@ -32,6 +33,9 @@ impl<K, V> NodeEnums<K, V> {
             _ => false,
         }
     }
+    fn into_box(self) -> *mut NodeEnums<K, V> {
+        Box::into_raw(Box::new(self))
+    }
 }
 
 impl<K, V> BaseNode<K, V>
@@ -41,7 +45,8 @@ where
     fn new() -> BaseNode<K, V> {
         Self {
             lock: Mutex::new(()),
-            node: Atomic::null(),
+            k: AtomicPtr::default(),
+            node: AtomicPtr::default(),
         }
     }
 }
@@ -98,12 +103,13 @@ static mut NCPU: usize = 0;
 const INIT: Once = Once::new();
 
 pub struct ConcurrentHashMap<K, V, S = RandomState> {
+    collector: Collector,
     hash_builder: S,
     // The array of bins. Lazily initialized upon first insertion. Size is always a power of two.
     // Accessed directly by iterators.
-    table: Atomic<Arc<Vec<BaseNode<K, V>>>>,
+    table: AtomicPtr<Box<[BaseNode<K, V>]>>,
     // The next table to use; non-null only while resizing.
-    next_table: Atomic<Arc<Vec<BaseNode<K, V>>>>,
+    next_table: AtomicPtr<Box<[BaseNode<K, V>]>>,
     // Base counter value, used mainly when there is no contention,
     // but also as a fallback during table initialization races. Updated via CAS.
     base_count: AtomicIsize,
@@ -127,11 +133,7 @@ where
 {
     pub fn len(&self) -> usize {
         unsafe {
-            if let Some(option) = self
-                .table
-                .load(Ordering::Acquire, &crossbeam_epoch::pin())
-                .as_ref()
-            {
+            if let Some(option) = self.table.load(Ordering::Acquire).as_ref() {
                 option.len()
             } else {
                 0
@@ -150,6 +152,7 @@ where
             }
         });
         Self {
+            collector: Collector::new(),
             hash_builder: RandomState::new(),
             table: Default::default(),
             next_table: Default::default(),
@@ -176,28 +179,29 @@ where
         }
     }
 
-    fn get(&self, key: &K) -> Option<Arc<V>> {
+    fn get(&self, key: &K) -> Option<Value<V>> {
         let h = self.spread(key);
-        let guard = &crossbeam_epoch::pin();
-        let tab = self.table.load(Ordering::Acquire, guard);
+        let guard_ = self.collector.pin();
+        let tab = self.table.load(Ordering::Acquire) ;
+        if tab.is_null() {
+            return None;
+        }
         unsafe {
-            if let Some(tab) = tab.as_ref() {
-                let n = tab.len();
-                let eb = &tab[(n - 1) & h];
-                let mut e_node_share = eb.node.load(Ordering::Acquire, guard);
-                if let Some(e) = e_node_share.as_ref() {
-                    return match e {
-                        NodeEnums::Node(e) => e.find(h, key, guard),
-                        NodeEnums::ForwardingNode(e) => e.find(h, key, guard),
-                        NodeEnums::TreeBin(e) => e.find(h, key, guard),
-                    };
-                }
+            let tab = &*tab;
+            let n = tab.len();
+
+            let eb = (*tab.as_ptr().add((n - 1) & h)).node.load(Ordering::Relaxed);
+            if eb.is_null() {
                 return None;
             }
+            match &*eb {
+                NodeEnums::Node(e) => e.find(h,key),
+                NodeEnums::ForwardingNode(e) => e.find(h, key),
+                NodeEnums::TreeBin(e) => e.find(h, key),
+            }.map(|v| Value::new(guard_, v))
         }
-        return None;
     }
-    fn insert(&self, key: K, value: V) -> Option<Arc<V>> {
+    fn insert(&self, key: K, value: V) -> Option<Value<V>> {
         unsafe { self.put_val(key, value, false) }
     }
 }
@@ -207,10 +211,10 @@ where
     K: Hash + Eq + Send + 'static,
     V: Send + 'static,
 {
-    fn init_table<'a>(&self, guard: &'a Guard) -> Shared<'a, Arc<Vec<BaseNode<K, V>>>> {
+    fn init_table(&self) {
         loop {
-            let shared = self.table.load(Ordering::Acquire, guard);
-            if shared.is_null() {
+            let p = self.table.load(Ordering::Acquire);
+            if p.is_null() {
                 let sc = self.size_ctl.load(Ordering::Acquire);
                 if sc < 0 {
                     spin_loop();
@@ -219,8 +223,8 @@ where
                     .compare_exchange(sc, -1, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
                 {
-                    let shared = self.table.load(Ordering::Acquire, guard);
-                    if shared.is_null() {
+                    let p = self.table.load(Ordering::Acquire);
+                    if p.is_null() {
                         let n = if sc > 0 {
                             sc as usize
                         } else {
@@ -231,7 +235,7 @@ where
                                 self.table.store(v, Ordering::Release);
                                 self.size_ctl
                                     .store((n - (n >> 2)) as isize, Ordering::Release);
-                                return self.table.load(Ordering::Acquire, guard);
+                                return;
                             }
                             Err(e) => {
                                 self.size_ctl.store(sc, Ordering::Release);
@@ -241,7 +245,7 @@ where
                     }
                 }
             } else {
-                return shared;
+                return;
             }
         }
     }
@@ -283,7 +287,7 @@ where
                 if s < sc {
                     break;
                 }
-                let tab = self.table.load(Ordering::Acquire, guard);
+                let tab = self.table.load(Ordering::Acquire);
                 if let Some(tab) = tab.as_ref() {
                     let n = tab.len();
                     if n >= MAXIMUM_CAPACITY {
@@ -297,7 +301,7 @@ where
                         {
                             break;
                         }
-                        let nt = self.next_table.load(Ordering::Acquire, guard);
+                        let nt = self.next_table.load(Ordering::Acquire);
                         if let Some(nt) = nt.as_ref() {
                             if self.transfer_index.load(Ordering::Acquire) <= 0 {
                                 break;
@@ -307,7 +311,7 @@ where
                                 .compare_exchange(sc, sc + 1, Ordering::AcqRel, Ordering::Relaxed)
                                 .is_ok()
                             {
-                                self.transfer(tab, Some(nt.clone()), guard)
+                                self.transfer(tab, Some(nt), guard)
                             }
                         } else {
                             break;
@@ -386,94 +390,90 @@ where
         }
     }
 
-    unsafe fn put_val(&self, key: K, value: V, only_if_absent: bool) -> Option<Arc<V>> {
+    unsafe fn put_val(&self, key: K, value: V, only_if_absent: bool) -> Option<Value<V>> {
         let hash = self.spread(&key);
-        let value = Arc::new(value);
-        let key = Arc::new(key);
-        let mut node_option: Option<Owned<NodeEnums<K, V>>> = None;
-        let guard = &crossbeam_epoch::pin();
+        let key = Box::into_raw(Box::new(key)) as *const _;
+        let value = Box::into_raw(Box::new(value));
+        let mut node_option = None;
+        let guard_ = self.collector.pin();
+        let guard = &guard_;
         let mut bin_count = 0;
-        let old: Option<Arc<V>> = 'a: loop {
-            let mut shared = self.table.load(Ordering::Acquire, guard);
-            if shared.is_null() {
-                shared = self.init_table(guard);
-            }
-            let table = unsafe { shared.deref() };
-            let n = table.len();
+        let old = 'a: loop {
+            let tab = self.table.load(Ordering::Acquire);
+            let tab = match tab.as_ref() {
+                None => {
+                    self.init_table();
+                    continue;
+                }
+                Some(tab) => tab,
+            };
+            let n = tab.len();
             let i = (n - 1) & hash;
-            let f = &table[i];
+            let f = &tab[i];
             let f_node_atomic = &f.node;
-            let mut f_node_share = f_node_atomic.load(Ordering::Acquire, guard);
-            //节点为空则cas替换
-            if f_node_share.is_null() {
+            let f_node_ptr = f_node_atomic.load(Ordering::Acquire);
+            if f_node_ptr.is_null() {
                 let node = node_option.unwrap_or_else(|| {
-                    Owned::new(NodeEnums::Node(Arc::new(Node::new(
-                        hash,
-                        key.clone(),
-                        value.clone(),
-                    ))))
+                    Box::into_raw(Box::new(NodeEnums::Node(Node::new(hash, key, value))))
                 });
                 match f_node_atomic.compare_exchange(
-                    f_node_share,
+                    f_node_ptr,
                     node,
                     Ordering::AcqRel,
-                    Ordering::Acquire,
-                    guard,
+                    Ordering::Relaxed,
                 ) {
                     Ok(_) => {
                         break None;
                     }
                     Err(e) => {
-                        node_option = Some(e.new);
+                        node_option = Some(e);
                         continue;
                     }
                 }
             }
-            let f_node = unsafe { f_node_share.deref_mut() };
+            let f_node = &mut *f_node_ptr;
             if let NodeEnums::ForwardingNode(f_move) = f_node {
-                self.help_transfer(table, &f_move.next_table, guard);
+                self.help_transfer(tab, f_move.next_table, guard);
             } else {
                 let mutex_guard = f.lock.lock();
-                if f_node_atomic.load(Ordering::Acquire, guard) == f_node_share {
+                if f_node_atomic.load(Ordering::Acquire) == f_node_ptr {
                     match f_node {
                         NodeEnums::Node(link_node) => {
                             bin_count = 1;
-                            let mut e = link_node.deref();
+                            let mut e = link_node;
                             loop {
                                 if e.hash == hash && e.key == key {
-                                    let old = e.val.load(Ordering::Acquire, guard).deref().clone();
+                                    let old = e.val;
                                     if !only_if_absent {
-                                        let shared =
-                                            e.val.swap(Owned::new(value), Ordering::AcqRel, guard);
-                                        guard.defer_destroy(shared);
+                                        e.val = value;
+                                        //由返回的引用释放value
                                     }
                                     break 'a Some(old);
                                 }
-                                if let Some(next) = e.next.load(Ordering::Acquire, guard).as_ref() {
-                                    e = next;
-                                } else {
+                                let next = e.next.load(Ordering::Acquire);
+                                if next.is_null() {
                                     e.next.store(
-                                        Owned::new(Arc::new(Node::new(hash, key, value))),
+                                        Node::new(hash, key, value).into_box(),
                                         Ordering::Release,
                                     );
                                     drop(mutex_guard);
                                     if bin_count >= TREEIFY_THRESHOLD {
-                                        self.treeify_bin(table, i, guard);
+                                        self.treeify_bin(tab, i, guard);
                                     }
                                     break 'a None;
                                 }
+                                e = &mut *next;
                                 bin_count += 1;
                             }
                         }
                         NodeEnums::TreeBin(f) => {
                             bin_count = 2;
-                            if let Some(p) = f.put_tree_val(hash, &key, &value, guard) {
-                                let old = p.val.load(Ordering::Acquire, guard).deref().clone();
+                            if let Some(p) = f.put_tree_val(hash, key, value, guard) {
+                                let old = p.val;
                                 if !only_if_absent {
-                                    let shared =
-                                        p.val.swap(Owned::new(value), Ordering::AcqRel, guard);
-                                    guard.defer_destroy(shared);
+                                    p.val = value;
                                 }
+                                //由返回的引用释放value
                                 break 'a Some(old);
                             }
                             break 'a None;
@@ -489,39 +489,50 @@ where
                 self.add_count(1, bin_count as isize, guard);
                 None
             }
-            Some(v) => Some(v),
+            Some(v) => Some(Value::new_drop(guard_, v)),
         }
     }
     /// Replaces all linked nodes in bin at given index unless table is
     /// too small, in which case resizes instead.
-    unsafe fn treeify_bin(&self, tab: &Vec<BaseNode<K, V>>, index: usize, guard: &Guard) {
+    unsafe fn treeify_bin(&self, tab: &Box<[BaseNode<K, V>]>, index: usize, guard: &Guard) {
         let n = tab.len();
         if n < MIN_TREEIFY_CAPACITY {
             self.try_presize(n << 1, guard);
         } else {
             let tab_at = &tab[index];
-            let b_shared = tab_at.node.load(Ordering::Acquire, guard);
+            let b_shared = tab_at.node.load(Ordering::Acquire);
             if let Some(b) = b_shared.as_ref() {
                 if let NodeEnums::Node(b) = b {
                     let mutex_guard = tab_at.lock.lock();
-                    if b_shared == tab_at.node.load(Ordering::Acquire, guard) {
+                    if b_shared == tab_at.node.load(Ordering::Acquire) {
                         let mut e = b;
-                        let hd = Box::into_raw(Box::new(TreeNode::new(e.clone())));
+                        let f = Node::new(e.hash, e.key, e.val).into_box();
+                        let hd = TreeNode::new(f).into_box();
                         let mut tail = hd;
-                        // Reuse existing linked lists
-                        while let Some(pd) = e.next.load(Ordering::Acquire, guard).as_ref() {
-                            // Do not maintain 'prev' when using linked lists
-                            pd.prev.store(Owned::new(e.clone()), Ordering::Release);
-                            let p = Box::into_raw(Box::new(TreeNode::new(pd.clone())));
-                            // Use 'right' as' next '
+                        let pd = e.next.load(Ordering::Acquire);
+                        if !pd.is_null() {
+                            let p = TreeNode::new(pd).into_box();
                             (*tail).right = p;
-                            tail = p;
-                            e = pd;
+                            (*pd).prev.store(f, Ordering::Release);
+                            let mut e = pd;
+                            // Reuse existing linked lists
+                            loop {
+                                let pd = (*e).next.load(Ordering::Acquire);
+                                if pd.is_null() {
+                                    break;
+                                }
+                                let p = TreeNode::new(pd).into_box();
+                                // Use 'right' as' next '
+                                (*tail).right = p;
+                                // Do not maintain 'prev' when using linked lists
+                                (*pd).prev.store(e, Ordering::Release);
+                                tail = p;
+                                e = pd;
+                            }
                         }
                         let shared = tab_at.node.swap(
-                            Owned::new(NodeEnums::TreeBin(TreeBin::new(hd))),
+                            NodeEnums::TreeBin(TreeBin::new(hd)).into_box(),
                             Ordering::AcqRel,
-                            guard,
                         );
                         if !shared.is_null() {
                             guard.defer_destroy(shared);
@@ -562,14 +573,14 @@ where
             sc = size_ctl.load(Ordering::Acquire);
             sc >= 0
         } {
-            let tab = table.load(Ordering::Acquire, guard);
+            let tab = table.load(Ordering::Acquire);
             if tab.is_null() {
                 let n = if sc as usize > c { sc as usize } else { c };
                 if size_ctl
                     .compare_exchange(sc, -1, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
                 {
-                    if table.load(Ordering::Acquire, guard) == tab {
+                    if table.load(Ordering::Acquire) == tab {
                         match Self::new_tab(n) {
                             Ok(tab) => {
                                 table.store(tab, Ordering::Release);
@@ -587,7 +598,7 @@ where
             } else if c <= sc as usize {
                 break;
             } else {
-                let tab = tab.deref();
+                let tab = &*tab;
                 let n = tab.len();
                 if n > MAXIMUM_CAPACITY {
                     break;
@@ -595,7 +606,7 @@ where
                 let rs = resize_stamp(n as isize);
                 if sc < 0 {
                     if (sc >> RESIZE_STAMP_SHIFT) != rs || sc == rs + 1 || sc == rs + MAX_RESIZERS {
-                        let nt = self.next_table.load(Ordering::Acquire, guard);
+                        let nt = self.next_table.load(Ordering::Acquire);
                         if let Some(nt) = nt.as_ref() {
                             if self.transfer_index.load(Ordering::Acquire) <= 0 {
                                 break;
@@ -604,7 +615,7 @@ where
                                 .compare_exchange(sc, sc + 1, Ordering::AcqRel, Ordering::Relaxed)
                                 .is_ok()
                             {
-                                self.transfer(tab, Some(nt.clone()), guard);
+                                self.transfer(tab, Some(nt), guard);
                             }
                         } else {
                             break;
@@ -628,8 +639,8 @@ where
     /// Helps transfer if a resize is in progress.
     unsafe fn help_transfer(
         &self,
-        tab: &Vec<BaseNode<K, V>>,
-        next_tab: &Arc<Vec<BaseNode<K, V>>>,
+        tab: &Box<[BaseNode<K, V>]>,
+        next_tab: *const Box<[BaseNode<K, V>]>,
         guard: &Guard,
     ) {
         let rs = resize_stamp(tab.len() as isize);
@@ -647,7 +658,7 @@ where
                 .compare_exchange(sc, sc + 1, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
-                self.transfer(tab, Some(next_tab.clone()), guard);
+                self.transfer(tab, Some(next_tab), guard);
                 return;
             }
         }
@@ -655,8 +666,8 @@ where
     /// Moves and/or copies the nodes in each bin to new table. See above for explanation.
     unsafe fn transfer(
         &self,
-        tab: &Vec<BaseNode<K, V>>,
-        next_tab: Option<Arc<Vec<BaseNode<K, V>>>>,
+        tab: &[BaseNode<K, V>],
+        next_tab: Option<*const Box<[BaseNode<K, V>]>>,
         guard: &Guard,
     ) {
         let n = tab.len();
@@ -666,19 +677,15 @@ where
         }
         let size_ctl = &self.size_ctl;
         let next_table = &self.next_table;
-        let next_tab = match next_tab {
+        let transfer_index = &self.transfer_index;
+        let next_tab_ptr = match next_tab {
             None => {
                 // initiating
-                match panic::catch_unwind(|| {
-                    let n = n << 1;
-                    let mut tab: Vec<BaseNode<K, V>> = Vec::with_capacity(n);
-                    tab.resize_with(n, || BaseNode::new());
-                    let tab = Arc::new(tab);
-                    (Owned::new(tab.clone()), tab)
-                }) {
-                    Ok((nt, next_tab)) => {
+                match Self::new_tab(n << 1) {
+                    Ok(nt) => {
                         next_table.store(nt, Ordering::Release);
-                        next_tab
+                        transfer_index.store(n as isize, Ordering::Release);
+                        nt
                     }
                     Err(e) => {
                         // try to cope with OOME
@@ -689,13 +696,13 @@ where
             }
             Some(next_tab) => next_tab,
         };
+        let next_tab = &*next_tab_ptr;
         let nextn = next_tab.len() as isize;
-        let fwd = ForwardingNode::new(next_tab.clone());
+        let fwd = ForwardingNode::new(next_tab_ptr);
         let mut advance = true;
         let mut finishing = false; // to ensure sweep before committing nextTab
         let mut i = 0;
         let mut bound = 0;
-        let transfer_index = &self.transfer_index;
         let n = n as isize;
         loop {
             while advance {
@@ -727,16 +734,9 @@ where
             }
             if i < 0 || i >= n || i + n >= nextn {
                 if finishing {
-                    let shared = next_table.swap(Shared::null(), Ordering::Release, guard);
-                    if !shared.is_null() {
-                        guard.defer_destroy(shared);
-                    }
-                    let shared = self
-                        .table
-                        .swap(Owned::new(next_tab), Ordering::Release, guard);
-                    if !shared.is_null() {
-                        guard.defer_destroy(shared);
-                    }
+                    let next_table_ptr = next_table.swap(ptr::null_mut(), Ordering::AcqRel);
+                    let old_tab_ptr = self.table.swap(next_table_ptr, Ordering::AcqRel);
+                    guard.defer_destroy(old_tab_ptr);
                     size_ctl.store((n << 1) - (n >> 1), Ordering::Release);
                     return;
                 }
@@ -751,106 +751,78 @@ where
             }
             let tab_at = &tab[i as usize];
             let tab_at_node = &tab_at.node;
-            let f_shared = tab_at_node.load(Ordering::Acquire, guard);
-            if let Some(f) = f_shared.as_ref() {
+            let f_ptr = tab_at_node.load(Ordering::Acquire);
+            if let Some(f) = f_ptr.as_ref() {
                 if f.is_moved() {
                     advance = true; // already processed
                     continue;
                 }
                 let n = n as usize;
                 let mutex_guard = tab_at.lock.lock();
-                if tab_at_node.load(Ordering::Acquire, guard) == f_shared {
+                if tab_at_node.load(Ordering::Acquire) == f_ptr {
                     match f {
                         NodeEnums::Node(f) => {
-                            let fh = f.hash;
-                            let mut run_bit = fh & n;
-                            let mut last_run = f;
-                            let mut p_shared = f.next.load(Ordering::Acquire, guard);
-                            while let Some(p) = p_shared.as_ref() {
-                                let b = p.hash & n;
-                                if b != run_bit {
-                                    run_bit = b;
-                                    last_run = p;
-                                }
-                                p_shared = p.next.load(Ordering::Acquire, guard);
-                            }
-                            let (mut ln, mut hn) = if run_bit == 0 {
-                                (Some(last_run.clone()), Option::<Arc<Node<K, V>>>::None)
-                            } else {
-                                (None, Some(last_run.clone()))
-                            };
+                            let mut ln: Option<Node<K, V>> = None;
+                            let mut hn: Option<Node<K, V>> = None;
                             let mut p = f;
-                            while p != last_run {
-                                let ph = p.hash;
-                                let pk = p.key.clone();
-                                let pv = p.val.load(Ordering::Acquire, guard).deref().clone();
-                                if (ph & n) == 0 {
-                                    if let Some(ln_node) = ln {
-                                        ln = Some(Arc::new(Node::new_next(ph, pk, pv, ln_node)));
+                            loop {
+                                let h = p.hash;
+                                if h & n == 0 {
+                                    ln = if let Some(ln) = ln {
+                                        Some(Node::new_next(h, p.key, p.val, ln.into_box()))
                                     } else {
-                                        ln = Some(Arc::new(Node::new(ph, pk, pv)));
+                                        Some(Node::new(h, p.key, p.val))
                                     }
                                 } else {
-                                    hn = if let Some(hn_node) = hn {
-                                        Some(Arc::new(Node::new_next(ph, pk, pv, hn_node)))
+                                    hn = if let Some(hn) = hn {
+                                        Some(Node::new_next(h, p.key, p.val, hn.into_box()))
                                     } else {
-                                        Some(Arc::new(Node::new(ph, pk, pv)))
-                                    };
+                                        Some(Node::new(h, p.key, p.val))
+                                    }
                                 }
-                                match p.next.load(Ordering::Acquire, guard).as_ref() {
-                                    None => {
-                                        break;
-                                    }
-                                    Some(tmp) => {
-                                        p = tmp;
-                                    }
+                                let next = p.next.load(Ordering::Acquire);
+                                if let Some(next) = next.as_ref() {
+                                    p = next
+                                } else {
+                                    break;
                                 }
                             }
                             if let Some(ln) = ln {
                                 next_tab[i as usize]
                                     .node
-                                    .store(Owned::new(NodeEnums::Node(ln)), Ordering::Release);
+                                    .store(NodeEnums::Node(ln).into_box(), Ordering::Release);
                             }
                             if let Some(hn) = hn {
                                 next_tab[i as usize + n]
                                     .node
-                                    .store(Owned::new(NodeEnums::Node(hn)), Ordering::Release);
+                                    .store(NodeEnums::Node(hn).into_box(), Ordering::Release);
                             }
-                            let shared_old = tab_at.node.swap(
-                                Owned::new(NodeEnums::ForwardingNode(fwd.clone())),
+                            let old = tab_at.node.swap(
+                                NodeEnums::ForwardingNode(fwd.clone()).into_box(),
                                 Ordering::AcqRel,
-                                guard,
                             );
-                            guard.defer_destroy(shared_old);
+                            guard.defer_destroy(old);
                             advance = true;
                         }
                         NodeEnums::TreeBin(t) => {
                             let mut lc = 0;
                             let mut hc = 0;
-                            let mut e_shared = t.first.load(Ordering::Acquire, guard);
+                            let mut e_ptr = t.first.load(Ordering::Acquire);
                             let mut lo = ptr::null_mut::<TreeNode<K, V>>();
                             let mut lo_tail = ptr::null_mut::<TreeNode<K, V>>();
                             let mut hi = ptr::null_mut::<TreeNode<K, V>>();
                             let mut hi_tail = ptr::null_mut::<TreeNode<K, V>>();
-                            while let Some(e) = e_shared.as_ref() {
+                            while let Some(e) = e_ptr.as_ref() {
                                 let h = e.hash;
-                                let ek = e.key.clone();
-                                let ev = e.val.load(Ordering::Acquire, guard).deref().clone();
-                                let p = Box::into_raw(Box::new(TreeNode::new(Arc::new(
-                                    Node::new(h, ek, ev),
-                                ))));
+                                let ek = e.key;
+                                let ev = e.val;
+                                let p = TreeNode::new(Node::new(h, ek, ev).into_box()).into_box();
                                 if (h & n) == 0 {
                                     if lo_tail.is_null() {
                                         lo = p;
                                     } else {
-                                        (*p).node.prev.store(
-                                            Owned::new((*lo_tail).node.clone()),
-                                            Ordering::Release,
-                                        );
-                                        (*lo_tail).node.next.store(
-                                            Owned::new((*p).node.clone()),
-                                            Ordering::Release,
-                                        );
+                                        (*(*p).node).prev.store((*lo_tail).node, Ordering::Release);
+                                        (*(*lo_tail).node).next.store((*p).node, Ordering::Release);
                                         (*lo_tail).right = p;
                                     }
                                     lo_tail = p;
@@ -859,54 +831,57 @@ where
                                     if hi_tail.is_null() {
                                         hi = p;
                                     } else {
-                                        (*p).node.prev.store(
-                                            Owned::new((*hi_tail).node.clone()),
-                                            Ordering::Release,
-                                        );
-                                        (*hi_tail).node.next.store(
-                                            Owned::new((*p).node.clone()),
-                                            Ordering::Release,
-                                        );
+                                        (*(*p).node)
+                                            .prev
+                                            .store((*hi_tail).node.clone(), Ordering::Release);
+                                        (*(*hi_tail).node)
+                                            .next
+                                            .store((*p).node.clone(), Ordering::Release);
                                         (*hi_tail).right = p;
                                     }
                                     hi_tail = p;
                                     hc += 1;
                                 }
-                                e_shared = e.next.load(Ordering::Acquire, guard);
+                                e_ptr = e.next.load(Ordering::Acquire);
                             }
                             let ln = if lc < UNTREEIFY_THRESHOLD {
                                 if lo.is_null() {
                                     None
                                 } else {
-                                    Some(Owned::new(NodeEnums::Node(Self::untreeify(&*lo))))
+                                    //需要回收当前节点
+                                    guard.defer_destroy((*lo).node);
+                                    Some(NodeEnums::Node(Self::untreeify(&*lo)))
                                 }
                             } else {
                                 if lo.is_null() {
                                     None
                                 } else {
-                                    Some(Owned::new(NodeEnums::TreeBin(TreeBin::new(lo))))
+                                    Some(NodeEnums::TreeBin(TreeBin::new(lo)))
                                 }
                             };
                             let hn = if hi.is_null() {
                                 None
                             } else if hc < UNTREEIFY_THRESHOLD {
-                                Some(Owned::new(NodeEnums::Node(Self::untreeify(&*hi))))
+                                guard.defer_destroy((*hi).node);
+                                Some(NodeEnums::Node(Self::untreeify(&*hi)))
                             } else {
-                                Some(Owned::new(NodeEnums::TreeBin(TreeBin::new(hi))))
+                                Some(NodeEnums::TreeBin(TreeBin::new(hi)))
                             };
                             if let Some(ln) = ln {
-                                next_tab[i as usize].node.store(ln, Ordering::Release);
+                                next_tab[i as usize]
+                                    .node
+                                    .store(ln.into_box(), Ordering::Release);
                             }
                             if let Some(hn) = hn {
-                                next_tab[i as usize + n].node.store(hn, Ordering::Release);
+                                next_tab[i as usize + n]
+                                    .node
+                                    .store(hn.into_box(), Ordering::Release);
                             }
 
-                            let shared = tab_at.node.swap(
-                                Owned::new(NodeEnums::ForwardingNode(fwd.clone())),
-                                Ordering::AcqRel,
-                                guard,
-                            );
-                            guard.defer_destroy(shared);
+                            let old = tab_at
+                                .node
+                                .swap(NodeEnums::ForwardingNode(fwd).into_box(), Ordering::AcqRel);
+                            guard.defer_destroy(old);
                             advance = true;
                         }
                         _ => {}
@@ -916,11 +891,10 @@ where
             } else {
                 advance = tab_at_node
                     .compare_exchange(
-                        f_shared,
-                        Owned::new(NodeEnums::ForwardingNode(fwd.clone())),
+                        f_ptr,
+                        NodeEnums::ForwardingNode(fwd).into_box(),
                         Ordering::AcqRel,
                         Ordering::Relaxed,
-                        guard,
                     )
                     .is_ok();
             }
@@ -928,15 +902,21 @@ where
     }
     /// Returns a list on non-TreeNodes replacing those in given list.
     #[inline]
-    fn untreeify(b: &TreeNode<K, V>) -> Arc<Node<K, V>> {
-        b.node.clone()
+    unsafe fn untreeify(b: &TreeNode<K, V>) -> Node<K, V> {
+        let node = &*b.node;
+        Node::new_next(
+            node.hash,
+            node.key,
+            node.val,
+            node.next.load(Ordering::Relaxed),
+        )
     }
-    fn new_tab(n: usize) -> thread::Result<Owned<Arc<Vec<BaseNode<K, V>>>>> {
+    fn new_tab(n: usize) -> thread::Result<*mut Box<[BaseNode<K, V>]>> {
         panic::catch_unwind(|| {
-            let mut tab: Vec<BaseNode<K, V>> = Vec::with_capacity(n);
-            tab.resize_with(n, || BaseNode::new());
-            let tab = Arc::new(tab);
-            Owned::new(tab)
+            let tab: Box<[BaseNode<K, V>]> = (0..n)
+                .map(|_| BaseNode::new())
+                .collect();
+             Box::into_raw(Box::new(tab))
         })
     }
 }

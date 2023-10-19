@@ -1,17 +1,16 @@
-use crossbeam_epoch::{Atomic, Guard, Owned, Shared};
 use std::any::Any;
 use std::hash::Hash;
 use std::ops::Deref;
-use std::ptr::null;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicPtr, Ordering};
 use std::sync::Arc;
 use std::thread::Thread;
 use std::{cmp, ptr, thread};
 
 use crate::concurrent_hash_map::node::Node;
+use crate::ebr::collector::Guard;
 
 pub(crate) struct TreeNode<K, V> {
-    pub(crate) node: Arc<Node<K, V>>,
+    pub(crate) node: *mut Node<K, V>,
     pub(crate) parent: *mut TreeNode<K, V>,
     pub(crate) left: *mut TreeNode<K, V>,
     pub(crate) right: *mut TreeNode<K, V>,
@@ -35,7 +34,10 @@ impl<K, V> TreeNode<K, V>
 where
     K: Hash + Eq,
 {
-    pub(crate) fn new(node: Arc<Node<K, V>>) -> TreeNode<K, V> {
+    pub(crate) fn into_box(self) -> *mut TreeNode<K, V> {
+        Box::into_raw(Box::new(self))
+    }
+    pub(crate) fn new(node: *mut Node<K, V>) -> TreeNode<K, V> {
         Self {
             node,
             parent: ptr::null_mut(),
@@ -44,7 +46,16 @@ where
             red: false,
         }
     }
-    pub(crate) fn new_parent(node: Arc<Node<K, V>>, parent: *mut TreeNode<K, V>) -> TreeNode<K, V> {
+    pub(crate) fn new_right(node: *mut Node<K, V>, right: *mut TreeNode<K, V>) -> TreeNode<K, V> {
+        Self {
+            node,
+            parent: ptr::null_mut(),
+            left: ptr::null_mut(),
+            right,
+            red: false,
+        }
+    }
+    pub(crate) fn new_parent(node: *mut Node<K, V>, parent: *mut TreeNode<K, V>) -> TreeNode<K, V> {
         Self {
             node,
             parent,
@@ -59,7 +70,7 @@ where
         loop {
             let pl = p.left;
             let pr = p.right;
-            let ph = p.node.hash;
+            let ph = (&*p.node).hash;
             if ph > h {
                 if pl.is_null() {
                     return None;
@@ -70,7 +81,7 @@ where
                     return None;
                 }
                 p = &*pr;
-            } else if p.node.key.deref() == key {
+            } else if &*(&*p.node).key == key {
                 return Some(p);
             } else if pl.is_null() {
                 if pr.is_null() {
@@ -98,14 +109,16 @@ const READER: isize = 4; // increment value for setting read lock
 
 pub(crate) struct TreeBin<K, V> {
     pub(crate) root: *mut TreeNode<K, V>,
-    pub(crate) first: Atomic<Arc<Node<K, V>>>,
-    waiter: Atomic<Thread>,
+    pub(crate) first: AtomicPtr<Node<K, V>>,
+    waiter: AtomicPtr<Thread>,
     lock_state: AtomicIsize,
 }
 
 impl<K, V> Drop for TreeBin<K, V> {
     fn drop(&mut self) {
         unsafe {
+            // first会复用，不需要回收
+            // waiter在释放锁后会回收
             if !self.root.is_null() {
                 drop(Box::from_raw(self.root));
             }
@@ -116,7 +129,7 @@ impl<K, V> Drop for TreeBin<K, V> {
 impl<K, V> TreeBin<K, V> {
     /// Creates bin with initial set of nodes headed by b.
     pub(crate) unsafe fn new(b: *mut TreeNode<K, V>) -> TreeBin<K, V> {
-        let first = Atomic::new(((&*b).node).clone());
+        let first = AtomicPtr::new((&*b).node);
         let mut r = ptr::null_mut::<TreeNode<K, V>>();
         let mut x = b;
         loop {
@@ -128,10 +141,10 @@ impl<K, V> TreeBin<K, V> {
                 (*x).red = false;
                 r = x;
             } else {
-                let h = (*x).node.hash;
+                let h = (*(*x).node).hash;
                 let mut p = r;
                 loop {
-                    let ph = (*p).node.hash;
+                    let ph = (*(*p).node).hash;
                     let xp = p;
                     if ph >= h {
                         p = (*p).left;
@@ -400,7 +413,7 @@ impl<K, V> TreeBin<K, V> {
                     .is_ok()
                 {
                     if waiting {
-                        let shared = waiter.swap(Shared::null(), Ordering::Relaxed, guard);
+                        let shared = waiter.swap(ptr::null_mut(), Ordering::Relaxed);
                         if !shared.is_null() {
                             unsafe {
                                 guard.defer_destroy(shared);
@@ -415,8 +428,10 @@ impl<K, V> TreeBin<K, V> {
                     .is_ok()
                 {
                     waiting = true;
-                    let shared =
-                        waiter.swap(Owned::new(thread::current()), Ordering::Relaxed, guard);
+                    let shared = waiter.swap(
+                        Box::into_raw(Box::new(thread::current())),
+                        Ordering::Relaxed,
+                    );
                     if !shared.is_null() {
                         unsafe {
                             guard.defer_destroy(shared);
@@ -450,16 +465,16 @@ where
 {
     /// Returns matching node or null if none. Tries to search using tree comparisons from root,
     /// but continues linear search when lock not available.
-    pub(crate) unsafe fn find(&self, h: usize, key: &K, guard: &Guard) -> Option<Arc<V>> {
-        let mut e_shared = self.first.load(Ordering::Acquire, guard);
+    pub(crate) unsafe fn find(&self, h: usize, key: &K) -> Option<*mut V> {
+        let mut e_shared = self.first.load(Ordering::Acquire);
         let lock_state = &self.lock_state;
         while let Some(e) = e_shared.as_ref() {
             let s = lock_state.load(Ordering::Acquire);
             if s & (WAITER | WRITER) != 0 {
-                if e.hash == h && e.key.deref() == key {
-                    return Some(e.val.load(Ordering::Acquire, guard).deref().clone());
+                if e.hash == h && &*e.key == key {
+                    return Some(e.val);
                 }
-                e_shared = e.next.load(Ordering::Acquire, guard);
+                e_shared = e.next.load(Ordering::Acquire);
             } else if lock_state
                 .compare_exchange(s, s + READER, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
@@ -468,7 +483,7 @@ where
                 // not null
                 let p = if !root.is_null() {
                     if let Some(t) = (*root).find_tree_node(h, key) {
-                        Some(t.node.val.load(Ordering::Acquire, guard).deref().clone())
+                        Some((*t.node).val)
                     } else {
                         None
                     }
@@ -476,7 +491,7 @@ where
                     None
                 };
                 if lock_state.fetch_add(-READER, Ordering::AcqRel) == (READER | WAITER) {
-                    let w = self.waiter.load(Ordering::Acquire, guard);
+                    let w = self.waiter.load(Ordering::Acquire);
                     if let Some(w) = w.as_ref() {
                         w.unpark();
                     }
@@ -492,55 +507,53 @@ where
     pub(crate) unsafe fn put_tree_val(
         &mut self,
         h: usize,
-        key: &Arc<K>,
-        value: &Arc<V>,
+        key: *const K,
+        value: *mut V,
         guard: &Guard,
-    ) -> Option<&Node<K, V>> {
+    ) -> Option<&mut Node<K, V>> {
         let root = self.root;
         let mut p = root;
         let mut searched = false;
         loop {
-            let pd = &(*p).node;
+            let pd = &mut *(*p).node;
             let ph = pd.hash;
             let xp = p;
             p = if ph > h {
                 (*p).left
             } else if ph < h {
                 (*p).right
-            } else if &pd.key == key {
+            } else if &*pd.key == &*key {
                 return Some(pd);
             } else {
                 if searched {
                     searched = true;
                     let ch = (*p).left;
                     if !ch.is_null() {
-                        if let Some(q) = (*ch).find_tree_node(h, key) {
-                            return Some(&q.node);
+                        if let Some(q) = (*ch).find_tree_node(h, &*key) {
+                            return Some(&mut *q.node);
                         }
                     }
                     let ch = (*p).right;
                     if !ch.is_null() {
-                        if let Some(q) = (*ch).find_tree_node(h, key) {
-                            return Some(&q.node);
+                        if let Some(q) = (*ch).find_tree_node(h, &*key) {
+                            return Some(&mut *q.node);
                         }
                     }
                 }
                 (*p).left
             };
             if p.is_null() {
-                let f = self.first.load(Ordering::Acquire, guard).deref();
-                let x = Arc::new(Node::new_next(h, key.clone(), value.clone(), f.clone()));
-                let shared = self
-                    .first
-                    .swap(Owned::new(x.clone()), Ordering::AcqRel, guard);
+                let f = self.first.load(Ordering::Acquire);
+                let x = Node::new_next(h, key, value, f).into_box();
+                let shared = self.first.swap(x, Ordering::AcqRel);
                 if !shared.is_null() {
                     guard.defer_destroy(shared);
                 }
-                let shared = f.prev.swap(Owned::new(f.clone()), Ordering::AcqRel, guard);
+                let shared = (*f).prev.swap(x, Ordering::AcqRel);
                 if !shared.is_null() {
                     guard.defer_destroy(shared);
                 }
-                let x = Box::into_raw(Box::new(TreeNode::new_parent(x, xp)));
+                let x = TreeNode::new_parent(x, xp).into_box();
                 if ph >= h {
                     (*xp).left = x;
                 } else {
@@ -569,13 +582,13 @@ where
         guard: &Guard,
     ) -> bool {
         let null = ptr::null_mut();
-        let next = (*p).node.next.load(Ordering::Acquire, guard);
-        let prev = (*p).node.prev.load(Ordering::Acquire, guard); // unlink traversal pointers
+        let next = (*(*p).node).next.load(Ordering::Acquire);
+        let prev = (*(*p).node).prev.load(Ordering::Acquire); // unlink traversal pointers
         let (shared, is_null) = if let Some(prev) = prev.as_ref() {
-            (prev.next.swap(next, Ordering::AcqRel, guard), false)
+            (prev.next.swap(next, Ordering::AcqRel), false)
         } else {
             let is_null = next.is_null();
-            (self.first.swap(next, Ordering::AcqRel, guard), is_null)
+            (self.first.swap(next, Ordering::AcqRel), is_null)
         };
         if !shared.is_null() {
             guard.defer_destroy(shared);
@@ -584,7 +597,7 @@ where
             return true;
         }
         if let Some(next) = next.as_ref() {
-            let shared = next.prev.swap(prev, Ordering::AcqRel, guard);
+            let shared = next.prev.swap(prev, Ordering::AcqRel);
             if !shared.is_null() {
                 guard.defer_destroy(shared);
             }
@@ -700,19 +713,5 @@ where
         }
         self.unlock_root();
         false
-    }
-}
-
-#[cfg(test)]
-mod test_tree {
-    use crate::concurrent_hash_map::node::Node;
-    use crate::concurrent_hash_map::tree::{TreeBin, TreeNode};
-    use std::sync::Arc;
-
-    #[test]
-    fn new_tree_bin() {
-        let node = Node::new(1, Arc::new(1), Arc::new(1));
-        let tree_node = TreeNode::new(Arc::new(node));
-        let bin = unsafe { TreeBin::new(tree_node) };
     }
 }

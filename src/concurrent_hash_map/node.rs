@@ -1,16 +1,12 @@
 use std::hash::Hash;
-use std::ops::Deref;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
-
-use crossbeam_epoch::{Atomic, Guard};
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 pub(crate) struct Node<K, V> {
     pub(crate) hash: usize,
-    pub(crate) key: Arc<K>,
-    pub(crate) val: Atomic<Arc<V>>,
-    pub(crate) next: Atomic<Arc<Node<K, V>>>,
-    pub(crate) prev: Atomic<Arc<Node<K, V>>>,
+    pub(crate) key: *const K,
+    pub(crate) val: *mut V,
+    pub(crate) next: AtomicPtr<Node<K, V>>,
+    pub(crate) prev: AtomicPtr<Node<K, V>>,
 }
 
 impl<K, V> PartialEq<Self> for Node<K, V>
@@ -28,46 +24,43 @@ impl<K, V> Node<K, V>
 where
     K: Hash + Eq,
 {
-    pub(crate) fn new(hash: usize, key: Arc<K>, val: Arc<V>) -> Node<K, V> {
+    pub(crate) fn into_box(self) -> *mut Node<K, V> {
+        Box::into_raw(Box::new(self))
+    }
+    pub(crate) fn new(hash: usize, key: *const K, val: *mut V) -> Node<K, V> {
         Self {
             hash,
             key,
-            val: Atomic::new(val),
-            next: Atomic::null(),
-            prev: Atomic::null(),
+            val,
+            next: AtomicPtr::default(),
+            prev: AtomicPtr::default(),
         }
     }
     pub(crate) fn new_next(
         hash: usize,
-        key: Arc<K>,
-        val: Arc<V>,
-        next: Arc<Node<K, V>>,
+        key: *const K,
+        val: *mut V,
+        next: *mut Node<K, V>,
     ) -> Node<K, V> {
         Self {
             hash,
             key,
-            val: Atomic::new(val),
-            next: Atomic::new(next),
-            prev: Atomic::null(),
+            val,
+            next: AtomicPtr::new(next),
+            prev: AtomicPtr::default(),
         }
     }
-    pub(crate) unsafe fn find(
-        self: &Arc<Node<K, V>>,
-        h: usize,
-        key: &K,
-        guard: &Guard,
-    ) -> Option<Arc<V>> {
+    pub(crate) unsafe fn find(&self, h: usize, key: &K) -> Option<*mut V> {
         let mut e = self;
         loop {
-            if e.hash == h && e.key.deref() == key {
-                return Some(e.val.load(Ordering::Acquire, guard).deref().clone());
+            if e.hash == h && &*e.key == key {
+                return Some(e.val);
             }
-            let p = e.next.load(Ordering::Acquire, guard);
-            if let Some(p) = p.as_ref() {
-                e = p;
-            } else {
+            let p = e.next.load(Ordering::Relaxed);
+            if p.is_null() {
                 return None;
             }
+            e = &*p;
         }
     }
 }
