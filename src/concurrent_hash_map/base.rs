@@ -1,10 +1,9 @@
+use std::{panic, ptr, thread};
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash};
 use std::hint::spin_loop;
-use std::ops::Deref;
+use std::sync::Once;
 use std::sync::atomic::{AtomicIsize, AtomicPtr, Ordering};
-use std::sync::{Arc, Once};
-use std::{panic, ptr, thread};
 
 use parking_lot::Mutex;
 
@@ -182,7 +181,7 @@ where
     fn get(&self, key: &K) -> Option<Value<V>> {
         let h = self.spread(key);
         let guard_ = self.collector.pin();
-        let tab = self.table.load(Ordering::Acquire) ;
+        let tab = self.table.load(Ordering::Acquire);
         if tab.is_null() {
             return None;
         }
@@ -509,15 +508,17 @@ where
                         let f = Node::new(e.hash, e.key, e.val).into_box();
                         let hd = TreeNode::new(f).into_box();
                         let mut tail = hd;
-                        let pd = e.next.load(Ordering::Acquire);
+                        let pd = e.next.load(Ordering::Relaxed);
                         if !pd.is_null() {
                             let p = TreeNode::new(pd).into_box();
                             (*tail).right = p;
-                            (*pd).prev.store(f, Ordering::Release);
+                            (*pd).prev.store(f, Ordering::Relaxed);
+                            (*f).next.store(pd,Ordering::Relaxed);
                             let mut e = pd;
+                            tail = p;
                             // Reuse existing linked lists
                             loop {
-                                let pd = (*e).next.load(Ordering::Acquire);
+                                let pd = (*e).next.load(Ordering::Relaxed);
                                 if pd.is_null() {
                                     break;
                                 }
@@ -525,7 +526,7 @@ where
                                 // Use 'right' as' next '
                                 (*tail).right = p;
                                 // Do not maintain 'prev' when using linked lists
-                                (*pd).prev.store(e, Ordering::Release);
+                                (*pd).prev.store(e, Ordering::Relaxed);
                                 tail = p;
                                 e = pd;
                             }
@@ -913,10 +914,8 @@ where
     }
     fn new_tab(n: usize) -> thread::Result<*mut Box<[BaseNode<K, V>]>> {
         panic::catch_unwind(|| {
-            let tab: Box<[BaseNode<K, V>]> = (0..n)
-                .map(|_| BaseNode::new())
-                .collect();
-             Box::into_raw(Box::new(tab))
+            let tab: Box<[BaseNode<K, V>]> = (0..n).map(|_| BaseNode::new()).collect();
+            Box::into_raw(Box::new(tab))
         })
     }
 }
