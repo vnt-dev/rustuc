@@ -1,11 +1,11 @@
-use std::collections::hash_map::RandomState;
-use std::hash::BuildHasher;
+use std::{mem, ptr, thread};
+use std::cell::RefCell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
-use std::{mem, ptr, thread};
 
 thread_local! {
     static THREAD_ID:u64 = unsafe { mem::transmute(thread::current().id()) };
+    static GC_COUNT:RefCell<u64> = RefCell::new(0);
 }
 const LEN: usize = 1 << 12;
 const RETIRE_LEN: usize = 1 << 8;
@@ -17,7 +17,6 @@ pub struct Collector {
     global_epoch: AtomicUsize,
     retire_list: Vec<AtomicPtr<Collectible>>,
     state: AtomicBool,
-    hasher: RandomState,
 }
 /// Number of words a piece of `Data` can hold.
 ///
@@ -100,10 +99,8 @@ impl Collector {
             global_epoch: Default::default(),
             retire_list,
             state: Default::default(),
-            hasher: RandomState::new(),
         }
     }
-    #[inline]
     pub fn pin(&self) -> Guard {
         let thread_id: u64 = THREAD_ID.with(|f| *f);
         let mut index = HASH_BITS & thread_id as usize;
@@ -120,7 +117,6 @@ impl Collector {
             collector: &self,
             epoch: global_epoch,
             index,
-            hash: self.hasher.hash_one(thread_id) as usize,
         }
     }
 
@@ -167,7 +163,6 @@ pub struct Guard<'a> {
     collector: &'a Collector,
     epoch: usize,
     index: usize,
-    hash: usize,
 }
 
 impl<'a> Drop for Guard<'a> {
@@ -175,7 +170,14 @@ impl<'a> Drop for Guard<'a> {
         let index = self.index;
         self.collector.epoch_array[index].store(usize::MAX, Ordering::Relaxed);
         self.collector.active_array[index].store(false, Ordering::Release);
-        self.collector.try_gc();
+        let count = GC_COUNT.with(|f| {
+            let c = *f.borrow() + 1;
+            *f.borrow_mut() = c;
+            c
+        });
+        if count & 0x3FF == 0x3FF {
+            self.collector.try_gc();
+        }
     }
 }
 
@@ -195,7 +197,7 @@ impl<'a> Guard<'a> {
         let c_p = Box::into_raw(Box::new(c));
         let next = &(*c_p).next;
         let epoch = self.epoch;
-        let hash = epoch.wrapping_add(self.hash) & (RETIRE_LEN - 1);
+        let hash = epoch.wrapping_add(self.index) & (RETIRE_LEN - 1);
         let hd = if hash == epoch.wrapping_sub(1) || hash == epoch.wrapping_add(1) {
             &self.collector.retire_list[epoch]
         } else {
